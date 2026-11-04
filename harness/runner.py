@@ -41,24 +41,57 @@ def main():
         "controlPlaneUrl": os.environ.get("CONTROL_PLANE_URL", ""),
         "startedAt": utc_now(),
     }
-    repo_path = clone_target_repo(payload["jobId"], target_repo, base_branch)
-    clone = summarize_clone(repo_path)
-    change = create_placeholder_change(repo_path, payload)
-    push = push_change(repo_path, change["runBranch"])
-    pull_request = create_pull_request(payload, change["runBranch"], push)
+    report_event(payload, "HARNESS_STARTED", "Harness started running.")
 
-    print(
-        json.dumps(
+    try:
+        repo_path = clone_target_repo(payload["jobId"], target_repo, base_branch)
+        clone = summarize_clone(repo_path)
+        change = create_placeholder_change(repo_path, payload)
+        push = push_change(repo_path, change["runBranch"])
+        pull_request = create_pull_request(payload, change["runBranch"], push)
+        if pull_request["enabled"]:
+            report_event(
+                payload,
+                "PR_CREATED",
+                "Harness created a pull request.",
+                {
+                    "number": pull_request["number"],
+                    "url": pull_request["url"],
+                },
+            )
+
+        result = {
+            "message": "Factory harness prepared target repository change",
+            "payload": payload,
+            "clone": clone,
+            "change": change,
+            "push": push,
+            "pullRequest": pull_request,
+        }
+
+        report_event(
+            payload,
+            "HARNESS_COMPLETED",
+            "Harness completed successfully.",
             {
-                "message": "Factory harness prepared target repository change",
-                "payload": payload,
                 "clone": clone,
                 "change": change,
                 "push": push,
                 "pullRequest": pull_request,
-            }
+            },
         )
-    )
+
+        print(json.dumps(result))
+    except (Exception, SystemExit) as error:
+        report_event(
+            payload,
+            "JOB_FAILED",
+            "Harness failed.",
+            {
+                "error": str(error),
+            },
+        )
+        raise
 
 
 def clone_target_repo(job_id, target_repo, base_branch):
@@ -199,6 +232,64 @@ def create_pull_request(payload, run_branch, push):
         "enabled": True,
         "number": response_body["number"],
         "url": response_body["html_url"],
+    }
+
+
+def report_event(payload, event_type, message, details=None):
+    control_plane_url = payload.get("controlPlaneUrl")
+    if not control_plane_url:
+        return {
+            "enabled": False,
+            "reason": "CONTROL_PLANE_URL not set",
+        }
+
+    request_body = json.dumps(
+        {
+            "type": event_type,
+            "message": message,
+            "details": details or {},
+        }
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        f"{control_plane_url.rstrip('/')}/jobs/{payload['jobId']}/events",
+        data=request_body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "factory-harness",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request) as response:
+            response_body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as error:
+        raise SystemExit(
+            json.dumps(
+                {
+                    "message": "Control-plane event reporting failed",
+                    "eventType": event_type,
+                    "status": error.code,
+                    "body": error.read().decode("utf-8"),
+                }
+            )
+        )
+    except urllib.error.URLError as error:
+        raise SystemExit(
+            json.dumps(
+                {
+                    "message": "Control-plane event reporting failed",
+                    "eventType": event_type,
+                    "reason": str(error.reason),
+                }
+            )
+        )
+
+    return {
+        "enabled": True,
+        "eventType": event_type,
+        "response": json.loads(response_body) if response_body else {},
     }
 
 
