@@ -39,6 +39,7 @@ def main():
         "title": os.environ["TITLE"],
         "description": os.environ["DESCRIPTION"],
         "controlPlaneUrl": os.environ.get("CONTROL_PLANE_URL", ""),
+        "changeMode": os.environ.get("CHANGE_MODE", "placeholder"),
         "startedAt": utc_now(),
     }
     report_event(payload, "HARNESS_STARTED", "Harness started running.")
@@ -46,7 +47,7 @@ def main():
     try:
         repo_path = clone_target_repo(payload["jobId"], target_repo, base_branch)
         clone = summarize_clone(repo_path)
-        change = create_placeholder_change(repo_path, payload)
+        change = create_change(repo_path, payload)
         push = push_change(repo_path, change["runBranch"])
         pull_request = create_pull_request(payload, change["runBranch"], push)
         if pull_request["enabled"]:
@@ -118,6 +119,16 @@ def clone_target_repo(job_id, target_repo, base_branch):
     return repo_path
 
 
+def create_change(repo_path, payload):
+    if payload["changeMode"] == "placeholder":
+        return create_placeholder_change(repo_path, payload)
+
+    if payload["changeMode"] == "codex":
+        return create_codex_change(repo_path, payload)
+
+    raise SystemExit(f"Unsupported CHANGE_MODE: {payload['changeMode']}")
+
+
 def summarize_clone(repo_path):
     top_level_entries = sorted(path.name for path in repo_path.iterdir())
     file_count = sum(1 for path in repo_path.rglob("*") if path.is_file() and ".git" not in path.parts)
@@ -129,6 +140,77 @@ def summarize_clone(repo_path):
         "fileCount": file_count,
         "topLevelEntries": top_level_entries[:20],
     }
+
+
+def create_codex_change(repo_path, payload):
+    run_branch = f"factory/job-{payload['jobId']}"
+    run(["git", "-C", str(repo_path), "checkout", "-b", run_branch])
+
+    prompt = "\n".join(
+        [
+            "You are running inside an automated software-factory harness.",
+            "You must modify repository files to satisfy the job request.",
+            "Do not answer with an explanation only.",
+            "Do not commit, push, or open a pull request.",
+            "After editing, leave changes unstaged for the harness to commit.",
+            "Keep changes focused and avoid unrelated refactors.",
+            "If tests need updating, update the narrowest relevant tests only.",
+            "",
+            f"Workflow: {payload['workflowId']}",
+            f"Title: {payload['title']}",
+            f"Description: {payload['description']}",
+        ]
+    )
+
+    run_codex(repo_path, prompt)
+
+    status = run(["git", "-C", str(repo_path), "status", "--short"]).stdout.strip()
+    if not status:
+        raise SystemExit("Codex completed without creating any git changes")
+
+    run(["git", "-C", str(repo_path), "config", "user.name", "Factory Harness"])
+    run(["git", "-C", str(repo_path), "config", "user.email", "factory-harness@example.invalid"])
+    run(["git", "-C", str(repo_path), "add", "."])
+    run(["git", "-C", str(repo_path), "commit", "-m", f"Apply factory change for {payload['jobId']}"])
+
+    commit_sha = run(["git", "-C", str(repo_path), "rev-parse", "HEAD"]).stdout.strip()
+    committed_status = run(["git", "-C", str(repo_path), "status", "--short"]).stdout.strip()
+
+    return {
+        "mode": "codex",
+        "runBranch": run_branch,
+        "commitSha": commit_sha,
+        "status": committed_status,
+    }
+
+
+def run_codex(repo_path, prompt):
+    codex = shutil.which("codex")
+    if not codex:
+        raise SystemExit("Codex CLI was not found in the harness image")
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise SystemExit("OPENAI_API_KEY is required for CHANGE_MODE=codex")
+
+    codex_env = {
+        **os.environ,
+        "OPENAI_API_KEY": api_key,
+        "CODEX_API_KEY": api_key,
+    }
+
+    run(
+        [
+            codex,
+            "exec",
+            "--skip-git-repo-check",
+            "--approve-for-me",
+            prompt,
+        ],
+        cwd=repo_path,
+        env=codex_env,
+        timeout=int(os.environ.get("CODEX_TIMEOUT_SECONDS", "300")),
+    )
 
 
 def create_placeholder_change(repo_path, payload):
@@ -306,8 +388,8 @@ def render_placeholder_run(payload, run_branch):
 """
 
 
-def run(command):
-    result = subprocess.run(command, text=True, capture_output=True)
+def run(command, cwd=None, input_text=None, env=None, timeout=None):
+    result = subprocess.run(command, text=True, capture_output=True, cwd=cwd, input=input_text, env=env, timeout=timeout)
     if result.returncode != 0:
         raise SystemExit(
             json.dumps(
