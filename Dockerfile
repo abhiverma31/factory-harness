@@ -9,6 +9,7 @@ RUN apt-get update \
 RUN npm install -g @openai/codex@latest    
 
 COPY harness ./harness
+COPY prompts ./prompts
 COPY harness.ini ./harness.ini
 
 CMD ["python", "-m", "harness.runner"]

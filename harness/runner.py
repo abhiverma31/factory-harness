@@ -16,6 +16,7 @@ REQUIRED_ENV = [
     "DESCRIPTION",
 ]
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "harness.ini"
+ASSESSMENT_PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "requirement_assessment.md"
 WORKSPACE_ROOT = Path("/tmp/factory-harness")
 
 
@@ -27,6 +28,7 @@ def main():
     config = load_config()
     target_repo = os.environ.get("TARGET_REPO") or config.get("target", "repo", fallback="")
     base_branch = os.environ.get("BASE_BRANCH") or os.environ.get("TARGET_BRANCH") or config.get("target", "branch", fallback="main")
+    available_repos = dict(config.items("repos")) if config.has_section("repos") else {}
 
     if not target_repo:
         raise SystemExit("Missing target repo. Set TARGET_REPO or [target].repo in harness.ini")
@@ -35,6 +37,7 @@ def main():
         "jobId": os.environ["JOB_ID"],
         "workflowId": os.environ["WORKFLOW_ID"],
         "targetRepo": target_repo,
+        "availableRepos": available_repos,
         "baseBranch": base_branch,
         "title": os.environ["TITLE"],
         "description": os.environ["DESCRIPTION"],
@@ -45,6 +48,29 @@ def main():
     report_event(payload, "HARNESS_STARTED", "Harness started running.")
 
     try:
+        hydrate_job_context(payload)
+        assessment = assess_requirement(payload)
+        if assessment["decision"] == "NEEDS_CLARIFICATION":
+            report_event(
+                payload,
+                "NEEDS_CLARIFICATION",
+                "Factory needs clarification before continuing.",
+                {
+                    "reason": assessment["reason"],
+                    "questions": assessment["questions"],
+                },
+            )
+            print(
+                json.dumps(
+                    {
+                        "message": "Factory harness requested clarification",
+                        "payload": payload,
+                        "assessment": assessment,
+                    }
+                )
+            )
+            return
+
         repo_path = clone_target_repo(payload["jobId"], target_repo, base_branch)
         clone = summarize_clone(repo_path)
         change = create_change(repo_path, payload)
@@ -64,6 +90,7 @@ def main():
         result = {
             "message": "Factory harness prepared target repository change",
             "payload": payload,
+            "assessment": assessment,
             "clone": clone,
             "change": change,
             "push": push,
@@ -75,6 +102,7 @@ def main():
             "HARNESS_COMPLETED",
             "Harness completed successfully.",
             {
+                "assessment": assessment,
                 "clone": clone,
                 "change": change,
                 "push": push,
@@ -119,6 +147,173 @@ def clone_target_repo(job_id, target_repo, base_branch):
     return repo_path
 
 
+def hydrate_job_context(payload):
+    control_plane_url = payload.get("controlPlaneUrl")
+    if not control_plane_url:
+        payload["messages"] = []
+        return
+
+    request = urllib.request.Request(
+        f"{control_plane_url.rstrip('/')}/jobs/{payload['jobId']}",
+        method="GET",
+        headers={
+            "User-Agent": "factory-harness",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=int(os.environ.get("CONTROL_PLANE_TIMEOUT_SECONDS", "30"))) as response:
+            job = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        raise SystemExit(
+            json.dumps(
+                {
+                    "message": "Control-plane job lookup failed",
+                    "status": error.code,
+                    "body": error.read().decode("utf-8"),
+                }
+            )
+        )
+    except urllib.error.URLError as error:
+        raise SystemExit(
+            json.dumps(
+                {
+                    "message": "Control-plane job lookup failed",
+                    "reason": str(error.reason),
+                }
+            )
+        )
+
+    messages = job.get("messages", [])
+    if not isinstance(messages, list):
+        messages = []
+
+    payload["messages"] = messages
+
+
+def assess_requirement(payload):
+    prompt = render_assessment_prompt(payload)
+    response_text = call_openai_assessment(prompt)
+
+    try:
+        assessment = json.loads(response_text)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"Requirement assessment returned invalid JSON: {error}: {response_text}")
+
+    decision = assessment.get("decision")
+    reason = assessment.get("reason")
+    questions = assessment.get("questions")
+
+    if decision not in {"IMPLEMENT_NOW", "NEEDS_CLARIFICATION"}:
+        raise SystemExit(f"Requirement assessment returned invalid decision: {decision}")
+
+    if not isinstance(reason, str) or not reason.strip():
+        raise SystemExit("Requirement assessment must include a non-empty reason")
+
+    if not isinstance(questions, list) or not all(isinstance(question, str) for question in questions):
+        raise SystemExit("Requirement assessment questions must be a list of strings")
+
+    if decision == "IMPLEMENT_NOW":
+        questions = []
+
+    if decision == "NEEDS_CLARIFICATION" and not questions:
+        raise SystemExit("Requirement assessment requested clarification without questions")
+
+    return {
+        "decision": decision,
+        "reason": reason.strip(),
+        "questions": questions,
+    }
+
+
+def render_assessment_prompt(payload):
+    template = ASSESSMENT_PROMPT_PATH.read_text(encoding="utf-8")
+    return (
+        template
+        .replace("{workflow_id}", payload["workflowId"])
+        .replace("{target_repo}", payload["targetRepo"])
+        .replace("{base_branch}", payload["baseBranch"])
+        .replace("{title}", payload["title"])
+        .replace("{description}", payload["description"])
+        .replace("{available_repos}", json.dumps(payload.get("availableRepos", {}), indent=2))
+        .replace("{messages}", json.dumps(payload.get("messages", []), indent=2))
+    )
+
+
+def call_openai_assessment(prompt):
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise SystemExit("OPENAI_API_KEY is required for requirement assessment")
+
+    request_body = json.dumps(
+        {
+            "model": os.environ.get("REQUIREMENT_ASSESSMENT_MODEL", "gpt-5-mini"),
+            "input": [
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+        }
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=request_body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=int(os.environ.get("REQUIREMENT_ASSESSMENT_TIMEOUT_SECONDS", "60"))) as response:
+            response_body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        raise SystemExit(
+            json.dumps(
+                {
+                    "message": "OpenAI requirement assessment failed",
+                    "status": error.code,
+                    "body": error.read().decode("utf-8"),
+                }
+            )
+        )
+    except urllib.error.URLError as error:
+        raise SystemExit(
+            json.dumps(
+                {
+                    "message": "OpenAI requirement assessment failed",
+                    "reason": str(error.reason),
+                }
+            )
+        )
+
+    response_text = extract_response_text(response_body)
+    if not response_text:
+        raise SystemExit(f"OpenAI requirement assessment returned no text: {json.dumps(response_body)}")
+
+    return response_text.strip()
+
+
+def extract_response_text(response_body):
+    output_text = response_body.get("output_text")
+    if isinstance(output_text, str):
+        return output_text
+
+    chunks = []
+    for item in response_body.get("output", []):
+        if item.get("type") != "message":
+            continue
+        for content in item.get("content", []):
+            text = content.get("text")
+            if isinstance(text, str):
+                chunks.append(text)
+
+    return "".join(chunks)
+
+
 def create_change(repo_path, payload):
     if payload["changeMode"] == "placeholder":
         return create_placeholder_change(repo_path, payload)
@@ -157,8 +352,16 @@ def create_codex_change(repo_path, payload):
             "If tests need updating, update the narrowest relevant tests only.",
             "",
             f"Workflow: {payload['workflowId']}",
+            f"Target repo: {payload['targetRepo']}",
+            f"Base branch: {payload['baseBranch']}",
             f"Title: {payload['title']}",
             f"Description: {payload['description']}",
+            "",
+            "Available repos:",
+            json.dumps(payload.get("availableRepos", {}), indent=2),
+            "",
+            "Conversation history:",
+            json.dumps(payload.get("messages", []), indent=2),
         ]
     )
 
